@@ -4,13 +4,14 @@ import requests
 import uvicorn
 import tempfile
 import time
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 from fastapi import FastAPI, HTTPException
 import google.generativeai as genai
 
+# Load environment variables
 load_dotenv()
 
 # --- CONFIGURATION ---
@@ -18,10 +19,16 @@ load_dotenv()
 # Configure GenAI immediately
 try:
     google_api_key = os.getenv("GOOGLE_API_KEY")
+    # If using Render, os.getenv works automatically with Environment Variables set in Dashboard
     if not google_api_key:
-        raise ValueError("GOOGLE_API_KEY not found in environment variables.")
-    genai.configure(api_key=google_api_key)
-    print("GenAI Configured successfully.")
+        # Fallback for local testing if .env is missing but variable is set in system
+        google_api_key = os.environ.get("GOOGLE_API_KEY")
+        
+    if not google_api_key:
+        print("CRITICAL WARNING: GOOGLE_API_KEY not found in environment.")
+    else:
+        genai.configure(api_key=google_api_key)
+        print("GenAI Configured successfully.")
 except Exception as e:
     print(f"Warning: Failed to configure GenAI on startup: {e}.")
 
@@ -65,30 +72,66 @@ class APIRequest(BaseModel):
 
 # --- HELPER FUNCTIONS ---
 
-def download_file(url_or_path: str) -> str:
+def download_file(url_or_path: str) -> Tuple[str, str]:
+    """
+    Downloads file and returns (local_path, mime_type).
+    """
     print(f"Attempting to process: {url_or_path}")
+    
+    # Default fallback
+    mime_type = "application/pdf"
+    suffix = ".pdf"
+    
     if url_or_path.startswith(('http://', 'https://')):
         try:
             response = requests.get(url_or_path, stream=True, timeout=30)
             response.raise_for_status()
-            content_type = response.headers.get('Content-Type', '').split(';')[0].lower()
-            suffix = ".pdf" if 'pdf' in content_type else ".png" if 'image' in content_type else ""
+            
+            # 1. Try to get type from Header
+            content_type = response.headers.get('Content-Type', '').lower()
+            
+            # 2. If Header is generic/empty, check URL extension logic
+            if 'pdf' in content_type:
+                mime_type = 'application/pdf'
+                suffix = '.pdf'
+            elif 'image' in content_type:
+                mime_type = content_type
+                suffix = '.png' # default suffix for images
+                if 'jpeg' in content_type or 'jpg' in content_type: suffix = '.jpg'
+            else:
+                # Fallback: Check URL string for extension (handles Azure Blob URLs)
+                url_lower = url_or_path.lower()
+                if '.pdf' in url_lower:
+                    mime_type = 'application/pdf'
+                    suffix = '.pdf'
+                elif '.png' in url_lower:
+                    mime_type = 'image/png'
+                    suffix = '.png'
+                elif '.jpg' in url_lower or '.jpeg' in url_lower:
+                    mime_type = 'image/jpeg'
+                    suffix = '.jpg'
+
             fd, path = tempfile.mkstemp(suffix=suffix)
             with os.fdopen(fd, 'wb') as tmp:
                 for chunk in response.iter_content(chunk_size=8192):
                     tmp.write(chunk)
-            print(f"Downloaded to {path}")
-            return path
+            print(f"Downloaded to {path} with inferred mime_type: {mime_type}")
+            return path, mime_type
+            
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Download failed: {str(e)}")
     else:
+        # Local file handling
         if os.path.exists(url_or_path):
-            return url_or_path
+            if url_or_path.lower().endswith('.pdf'):
+                return url_or_path, 'application/pdf'
+            elif url_or_path.lower().endswith(('.png', '.jpg', '.jpeg')):
+                return url_or_path, 'image/jpeg'
+            return url_or_path, 'application/pdf'
         raise HTTPException(status_code=400, detail=f"Local file not found: {url_or_path}")
 
 # --- CORE LOGIC ---
 
-# ADDED: response_model_exclude_none=True to hide null fields in the JSON output
 @app.post("/extract-bill-data", response_model=APIResponse, response_model_exclude_none=True)
 async def extract_bill_data(request: APIRequest):
     temp_path = None
@@ -96,13 +139,14 @@ async def extract_bill_data(request: APIRequest):
     usage = TokenUsage(total_tokens=0, input_tokens=0, output_tokens=0)
     
     try:
-        # 1. Download
-        temp_path = download_file(request.document)
+        # 1. Download (Returns tuple: path AND mime_type)
+        temp_path, mime_type = download_file(request.document)
         
         # 2. Upload to Gemini
-        print(f"Uploading file...")
+        print(f"Uploading file with mime_type: {mime_type}...")
         try:
-            upload_ref = genai.upload_file(path=temp_path, display_name="medical_bill_document")
+            # FIX: Explicitly pass mime_type to Gemini
+            upload_ref = genai.upload_file(path=temp_path, mime_type=mime_type, display_name="medical_bill_document")
         except Exception as e:
             raise ValueError(f"Upload failed. Check API Key. Error: {e}")
         
